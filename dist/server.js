@@ -844,6 +844,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// The host reaches this server through Node's keep-alive agent, which drops idle
+// sockets after 5 s, the same as this server's default. With equal timeouts the host
+// can reuse a socket at the moment this side closes it ("socket hang up" / 500).
+// Outlasting the agent means the host side always closes first.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
 server.listen(0, '127.0.0.1', () => {
   const addr = server.address();
   // The host waits for this exact JSON line before proxying requests.
