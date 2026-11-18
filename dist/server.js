@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { pipeline, Transform } from 'node:stream';
 import { createRequire } from 'node:module';
 
 // Vendored `ignore` 7.0.16 (MIT, see vendor/ignore.LICENSE-MIT), the matcher
@@ -277,10 +279,11 @@ async function sendRaw(q, res) {
   }
   if (!st.isFile()) throw new HttpError(400, 'Это не файл.');
   const name = path.basename(abs);
+  const disposition = q.get('download') === '1' ? 'attachment' : 'inline';
   res.writeHead(200, {
     'Content-Type': MIME[extOf(name)] || 'application/octet-stream',
     'Content-Length': st.size,
-    'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(name)}`,
+    'Content-Disposition': `${disposition}; filename*=UTF-8''${encodeURIComponent(name)}`,
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
   });
@@ -410,10 +413,393 @@ async function cancelUpload(b) {
   return { ok: true };
 }
 
+// ── ZIP download ─────────────────────────────────────────────────────────
+// A folder is streamed as a ZIP while it is read, so nothing is buffered or
+// written to disk. Sizes are unknown up front, so each file is followed by a data
+// descriptor. ZIP64 fields are used only where a value overflows 32 (or 16) bits,
+// which keeps small archives readable everywhere. Names are UTF-8 (flag bit 11).
+
+const ZIP64_LIMIT = Number(process.env.EXPLORER_ZIP64_LIMIT) || 0xffffffff;
+const ZIP64_COUNT_LIMIT = Number(process.env.EXPLORER_ZIP64_COUNT_LIMIT) || 0xffff;
+// Formats that are already compressed: deflating them again only burns CPU.
+const ZIP_STORE = new Set(['zip', 'rar', '7z', 'gz', 'bz2', 'xz', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'pdf',
+  'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'mp3', 'mp4', 'mov', 'webm', 'avi', 'mkv', 'ogg']);
+
+function dosDateTime(ms) {
+  const d = new Date(ms || Date.now());
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
+  const date = ((Math.max(d.getFullYear(), 1980) - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  return { time, date };
+}
+
+/** Yields what the folder view shows: entries in name order, honouring hidden and .gitignore. */
+async function* zipEntries(dir, prefix, matchers, opts, seen) {
+  let real;
+  try {
+    real = await fsp.realpath(dir);
+  } catch {
+    return;
+  }
+  if (seen.has(real)) return; // symlink loop
+  seen.add(real);
+  const own = opts.gitignore ? await withOwnMatcher(matchers, dir) : matchers;
+  let dirents;
+  try {
+    dirents = await fsp.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  dirents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const d of dirents) {
+    if (!opts.hidden && d.name.startsWith('.')) continue;
+    if (SKIP_IN_SEARCH.has(d.name)) continue;
+    const abs = path.join(dir, d.name);
+    let st;
+    try {
+      st = await fsp.stat(abs);
+    } catch {
+      continue; // broken link or vanished
+    }
+    const isDir = st.isDirectory();
+    if (own.length && isIgnored(own, abs, isDir)) continue;
+    if (isDir) {
+      yield { dir: true, name: `${prefix}${d.name}/`, mtime: st.mtimeMs };
+      yield* zipEntries(abs, `${prefix}${d.name}/`, own, opts, seen);
+    } else if (st.isFile()) {
+      yield { dir: false, abs, name: `${prefix}${d.name}`, size: st.size, mtime: st.mtimeMs };
+    }
+  }
+}
+
+async function sendZip(q, res) {
+  const root = requireRoot(q.get('root'));
+  const abs = inside(root, q.get('path') || '');
+  let st;
+  try {
+    st = await fsp.stat(abs);
+  } catch (err) {
+    throw fsError(err);
+  }
+  if (!st.isDirectory()) throw new HttpError(400, 'Это не папка.');
+  const base = path.basename(abs) || 'project';
+  const opts = { gitignore: wantsGitignore(q.get('gitignore')), hidden: q.get('hidden') === '1' };
+  const matchers = opts.gitignore && abs !== root ? await matchersFor(root, path.dirname(abs)) : [];
+
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(`${base}.zip`)}`,
+    'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
+  });
+
+  let offset = 0;
+  const central = [];
+  const write = (buf) => new Promise((resolve, reject) => {
+    if (res.destroyed) return reject(new Error('client went away'));
+    offset += buf.length;
+    if (res.write(buf)) return resolve();
+    const done = () => {
+      res.off('close', gone);
+      resolve();
+    };
+    const gone = () => {
+      res.off('drain', done);
+      reject(new Error('client went away'));
+    };
+    res.once('drain', done);
+    res.once('close', gone);
+  });
+
+  const addCentral = (e) => {
+    const big = e.csize >= ZIP64_LIMIT || e.usize >= ZIP64_LIMIT || e.offset >= ZIP64_LIMIT;
+    const extra = [];
+    if (e.usize >= ZIP64_LIMIT) extra.push(e.usize);
+    if (e.csize >= ZIP64_LIMIT) extra.push(e.csize);
+    if (e.offset >= ZIP64_LIMIT) extra.push(e.offset);
+    const ex = Buffer.alloc(extra.length ? 4 + extra.length * 8 : 0);
+    if (extra.length) {
+      ex.writeUInt16LE(0x0001, 0);
+      ex.writeUInt16LE(extra.length * 8, 2);
+      extra.forEach((v, i) => ex.writeBigUInt64LE(BigInt(v), 4 + i * 8));
+    }
+    const h = Buffer.alloc(46);
+    h.writeUInt32LE(0x02014b50, 0);
+    // Made by Unix: Info-ZIP unzip re-encodes MS-DOS-made names from the OEM code
+    // page despite the UTF-8 flag. Windows Explorer goes by the flag either way.
+    h.writeUInt16LE((3 << 8) | (big ? 45 : 30), 4); // made by
+    h.writeUInt16LE(big ? 45 : 20, 6); // needed
+    h.writeUInt16LE(e.flags, 8);
+    h.writeUInt16LE(e.method, 10);
+    h.writeUInt16LE(e.time, 12);
+    h.writeUInt16LE(e.date, 14);
+    h.writeUInt32LE(e.crc >>> 0, 16);
+    h.writeUInt32LE(e.csize >= ZIP64_LIMIT ? 0xffffffff : e.csize, 20);
+    h.writeUInt32LE(e.usize >= ZIP64_LIMIT ? 0xffffffff : e.usize, 24);
+    h.writeUInt16LE(e.nameBuf.length, 28);
+    h.writeUInt16LE(ex.length, 30);
+    h.writeUInt32LE(((e.dir ? 0o40775 : 0o100664) << 16 | (e.dir ? 0x10 : 0)) >>> 0, 38); // Unix mode + DOS dir bit
+    h.writeUInt32LE(e.offset >= ZIP64_LIMIT ? 0xffffffff : e.offset, 42);
+    central.push(Buffer.concat([h, e.nameBuf, ex]));
+  };
+
+  try {
+    const root0 = { dir: true, name: `${base}/`, mtime: st.mtimeMs };
+    const all = (async function* () {
+      yield root0;
+      yield* zipEntries(abs, `${base}/`, matchers, opts, new Set());
+    })();
+    for await (const item of all) {
+      const nameBuf = Buffer.from(item.name, 'utf8');
+      const { time, date } = dosDateTime(item.mtime);
+      const localOffset = offset;
+      if (item.dir) {
+        const h = Buffer.alloc(30);
+        h.writeUInt32LE(0x04034b50, 0);
+        h.writeUInt16LE(20, 4);
+        h.writeUInt16LE(0x0800, 6);
+        h.writeUInt16LE(0, 8);
+        h.writeUInt16LE(time, 10);
+        h.writeUInt16LE(date, 12);
+        h.writeUInt16LE(nameBuf.length, 26);
+        await write(Buffer.concat([h, nameBuf]));
+        addCentral({ dir: true, flags: 0x0800, method: 0, time, date, crc: 0, csize: 0, usize: 0, offset: localOffset, nameBuf });
+        continue;
+      }
+      const deflate = item.size > 0 && !ZIP_STORE.has(extOf(item.name));
+      // Only the size known now decides ZIP64 here; a file growing past 4 GB while
+      // being read is not supported.
+      const z64 = item.size >= ZIP64_LIMIT - 0x100000;
+      const ex = Buffer.alloc(z64 ? 20 : 0);
+      if (z64) {
+        ex.writeUInt16LE(0x0001, 0);
+        ex.writeUInt16LE(16, 2); // sizes stay 0 here; the data descriptor carries them
+      }
+      const h = Buffer.alloc(30);
+      h.writeUInt32LE(0x04034b50, 0);
+      h.writeUInt16LE(z64 ? 45 : 20, 4);
+      h.writeUInt16LE(0x0808, 6); // data descriptor + UTF-8
+      h.writeUInt16LE(deflate ? 8 : 0, 8);
+      h.writeUInt16LE(time, 10);
+      h.writeUInt16LE(date, 12);
+      if (z64) {
+        h.writeUInt32LE(0xffffffff, 18);
+        h.writeUInt32LE(0xffffffff, 22);
+      }
+      h.writeUInt16LE(nameBuf.length, 26);
+      h.writeUInt16LE(ex.length, 28);
+      await write(Buffer.concat([h, nameBuf, ex]));
+
+      let crc = 0;
+      let usize = 0;
+      let csize = 0;
+      const tap = new Transform({
+        transform(chunk, _enc, cb) {
+          crc = zlib.crc32(chunk, crc);
+          usize += chunk.length;
+          cb(null, chunk);
+        },
+      });
+      const parts = [fs.createReadStream(item.abs), tap];
+      if (deflate) parts.push(zlib.createDeflateRaw({ level: 6 }));
+      const out = pipeline(...parts, () => {});
+      for await (const chunk of out) {
+        csize += chunk.length;
+        await write(chunk);
+      }
+      const dd = Buffer.alloc(z64 ? 24 : 16);
+      dd.writeUInt32LE(0x08074b50, 0);
+      dd.writeUInt32LE(crc >>> 0, 4);
+      if (z64) {
+        dd.writeBigUInt64LE(BigInt(csize), 8);
+        dd.writeBigUInt64LE(BigInt(usize), 16);
+      } else {
+        dd.writeUInt32LE(csize, 8);
+        dd.writeUInt32LE(usize, 12);
+      }
+      await write(dd);
+      addCentral({ dir: false, flags: 0x0808, method: deflate ? 8 : 0, time, date, crc, csize, usize, offset: localOffset, nameBuf });
+    }
+
+    const cdStart = offset;
+    for (const c of central) await write(c);
+    const cdSize = offset - cdStart;
+    const count = central.length;
+    const need64 = count >= ZIP64_COUNT_LIMIT || cdStart >= ZIP64_LIMIT || cdSize >= ZIP64_LIMIT;
+    if (need64) {
+      const eocd64At = offset;
+      const z = Buffer.alloc(56);
+      z.writeUInt32LE(0x06064b50, 0);
+      z.writeBigUInt64LE(44n, 4);
+      z.writeUInt16LE(45, 12);
+      z.writeUInt16LE(45, 14);
+      z.writeBigUInt64LE(BigInt(count), 24);
+      z.writeBigUInt64LE(BigInt(count), 32);
+      z.writeBigUInt64LE(BigInt(cdSize), 40);
+      z.writeBigUInt64LE(BigInt(cdStart), 48);
+      const loc = Buffer.alloc(20);
+      loc.writeUInt32LE(0x07064b50, 0);
+      loc.writeBigUInt64LE(BigInt(eocd64At), 8);
+      loc.writeUInt32LE(1, 16);
+      await write(Buffer.concat([z, loc]));
+    }
+    const e = Buffer.alloc(22);
+    e.writeUInt32LE(0x06054b50, 0);
+    e.writeUInt16LE(need64 ? 0xffff : count, 8);
+    e.writeUInt16LE(need64 ? 0xffff : count, 10);
+    e.writeUInt32LE(need64 ? 0xffffffff : cdSize, 12);
+    e.writeUInt32LE(need64 ? 0xffffffff : cdStart, 16);
+    await write(e);
+    res.end();
+  } catch {
+    // Headers are gone already: the only honest signal left is a broken download.
+    res.destroy();
+  }
+}
+
+// ── Copy / move ──────────────────────────────────────────────────────────
+// Large copies outlive the ~100 s a proxy such as Cloudflare waits for a response,
+// so they run as jobs: POST /transfer starts one, GET /job reports progress.
+
+const JOB_TTL_MS = 10 * 60_000;
+const jobs = new Map();
+
+function sweepJobs() {
+  const now = Date.now();
+  for (const [id, j] of jobs) if (j.finished && now - j.finished > JOB_TTL_MS) jobs.delete(id);
+}
+
+async function exists(p) {
+  try {
+    await fsp.lstat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** "name (2).ext", "name (3).ext", … — the first one not taken in `dir`. */
+async function freeName(dir, name) {
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  for (let i = 2; i < 10_000; i++) {
+    const candidate = `${stem} (${i})${ext}`;
+    if (!(await exists(path.join(dir, candidate)))) return candidate;
+  }
+  throw new HttpError(409, 'Не удалось подобрать свободное имя.');
+}
+
+async function countFiles(p) {
+  const st = await fsp.lstat(p);
+  if (!st.isDirectory()) return 1;
+  let n = 1;
+  for (const name of await fsp.readdir(p)) n += await countFiles(path.join(p, name));
+  return n;
+}
+
+/** Copies a file, symlink or whole folder; symlinks are copied as links, not followed. */
+async function copyTree(src, dst, job, overwrite) {
+  const st = await fsp.lstat(src);
+  if (st.isSymbolicLink()) {
+    if (overwrite) await fsp.rm(dst, { force: true });
+    await fsp.symlink(await fsp.readlink(src), dst);
+  } else if (st.isDirectory()) {
+    await fsp.mkdir(dst);
+    for (const name of await fsp.readdir(src)) await copyTree(path.join(src, name), path.join(dst, name), job, false);
+    await fsp.utimes(dst, st.atime, st.mtime).catch(() => {});
+  } else {
+    await fsp.copyFile(src, dst, overwrite ? 0 : fs.constants.COPYFILE_EXCL);
+    await fsp.utimes(dst, st.atime, st.mtime).catch(() => {});
+  }
+  job.done++;
+}
+
+async function runTransfer(job, src, target, op, overwrite) {
+  try {
+    if (op === 'move') {
+      try {
+        await fsp.rename(src, target);
+        job.done = job.total;
+        return;
+      } catch (err) {
+        // A move across mount points (bind mounts included) cannot be a rename.
+        if (err.code !== 'EXDEV') throw err;
+      }
+    }
+    job.total = await countFiles(src);
+    await copyTree(src, target, job, overwrite);
+    if (op === 'move') {
+      job.phase = 'cleanup';
+      await fsp.rm(src, { recursive: true, force: true });
+    }
+  } catch (err) {
+    job.error = fsError(err).message;
+  } finally {
+    job.status = job.error ? 'error' : 'done';
+    job.finished = Date.now();
+  }
+}
+
+async function transfer(b) {
+  sweepJobs();
+  const root = requireRoot(b.root);
+  const op = b.op === 'move' ? 'move' : b.op === 'copy' ? 'copy' : null;
+  if (!op) throw new HttpError(400, 'Неизвестная операция.');
+  const src = inside(root, b.path);
+  if (src === root) throw new HttpError(400, 'Нельзя переносить или копировать корень проекта.');
+  const destDir = inside(root, b.dest || '');
+  let srcSt;
+  let destSt;
+  try {
+    srcSt = await fsp.lstat(src);
+    destSt = await fsp.stat(destDir);
+  } catch (err) {
+    throw fsError(err);
+  }
+  if (!destSt.isDirectory()) throw new HttpError(400, 'Папка назначения — не папка.');
+  const srcIsDir = srcSt.isDirectory();
+  if (srcIsDir && (destDir === src || destDir.startsWith(src + path.sep))) {
+    throw new HttpError(400, 'Нельзя положить папку внутрь неё самой.');
+  }
+  let name = path.basename(src);
+  let target = path.join(destDir, name);
+  if (op === 'move' && target === src) throw new HttpError(400, 'Уже лежит в этой папке.');
+  let overwrite = false;
+  if (await exists(target)) {
+    const conflict = b.conflict || (op === 'copy' && target === src ? 'rename' : 'fail');
+    if (conflict === 'rename') {
+      name = await freeName(destDir, name);
+      target = path.join(destDir, name);
+    } else if (conflict === 'replace') {
+      const tSt = await fsp.lstat(target);
+      if (srcIsDir || tSt.isDirectory()) throw new HttpError(400, 'Заменять можно только файл файлом.');
+      overwrite = true;
+    } else {
+      const e = new HttpError(409, `В папке назначения уже есть «${name}».`);
+      e.extra = { conflict: true, canReplace: !srcIsDir && !(await fsp.lstat(target)).isDirectory() };
+      throw e;
+    }
+  }
+  const id = crypto.randomUUID();
+  const job = { id, op, name, status: 'running', phase: op, done: 0, total: 1, error: null, finished: 0, path: relOf(root, target) };
+  jobs.set(id, job);
+  runTransfer(job, src, target, op, overwrite);
+  return { id };
+}
+
+async function jobStatus(q) {
+  const job = jobs.get(String(q.get('id') || ''));
+  if (!job) throw new HttpError(404, 'Задача не найдена.');
+  const { id, op, name, status, phase, done, total, error, path: target } = job;
+  return { id, op, name, status, phase, done, total, error, path: target };
+}
+
 // ── HTTP wiring ──────────────────────────────────────────────────────────
 
-const GET = { '/list': list, '/search': search };
-const POST = { '/mkdir': mkdir, '/rename': rename, '/delete': remove, '/upload': upload, '/upload-cancel': cancelUpload };
+const GET = { '/list': list, '/search': search, '/job': jobStatus };
+const POST = {
+  '/mkdir': mkdir, '/rename': rename, '/delete': remove, '/upload': upload, '/upload-cancel': cancelUpload, '/transfer': transfer,
+};
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -438,6 +824,10 @@ const server = http.createServer(async (req, res) => {
       await sendRaw(url.searchParams, res);
       return;
     }
+    if (req.method === 'GET' && url.pathname === '/zip') {
+      await sendZip(url.searchParams, res);
+      return;
+    }
     const handler = req.method === 'GET' ? GET[url.pathname] : req.method === 'POST' ? POST[url.pathname] : undefined;
     if (!handler) throw new HttpError(404, 'Неизвестный запрос.');
     const result = await handler(req.method === 'GET' ? url.searchParams : await readJson(req));
@@ -450,7 +840,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     res.writeHead(e.status, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ error: e.message }));
+    res.end(JSON.stringify({ error: e.message, ...(err.extra || {}) }));
   }
 });
 

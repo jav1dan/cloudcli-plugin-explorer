@@ -87,9 +87,35 @@ async function call(method, route, { query, body, signal } = {}) {
   } catch { /* non-JSON error page */ }
   if (!res.ok) {
     if (res.status === 401) throw new Error('Сессия CloudCLI истекла — обновите страницу и войдите снова.');
-    throw new Error(data?.error || data?.message || `Ошибка ${res.status}`);
+    throw Object.assign(new Error(data?.error || data?.message || `Ошибка ${res.status}`), {
+      status: res.status, conflict: !!data?.conflict, canReplace: !!data?.canReplace,
+    });
   }
   return data;
+}
+
+/**
+ * URL the browser can download from directly, so big files and ZIPs stream to disk
+ * instead of being held in memory. A plain navigation cannot send headers, so the
+ * CloudCLI token goes in `?token=`, which the host accepts (it does the same for its
+ * WebSockets).
+ */
+function directUrl(route, query) {
+  let token = null;
+  try {
+    token = localStorage.getItem('auth-token');
+  } catch { /* storage unavailable */ }
+  return `${RPC_BASE}${route}?${new URLSearchParams({ ...query, ...(token ? { token } : {}) })}`;
+}
+
+function saveAs(url, name) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 // ── Icons (24px, stroke) ─────────────────────────────────────────────────
@@ -114,6 +140,9 @@ const P = {
   trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
   home: '<path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/>',
   link: '<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
+  zip: '<path d="M21 8v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M10 12h4"/>',
+  copyTo: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/><path d="M12 14.5h5M14.5 12v5"/>',
+  moveTo: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 13h6M13 10.5l2.5 2.5-2.5 2.5"/>',
   git: '<circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="9" r="2.2"/><path d="M6 8.2v7.6M18 11.2c0 3-3 3.8-6 4.3-2 .3-4 .9-5.2 1.6"/>',
 };
 const icon = (name, cls = '') => `<svg class="ex-ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name]}</svg>`;
@@ -150,6 +179,7 @@ background:var(--ex-card);color:var(--ex-fg);border-radius:calc(var(--ex-r) - 2p
 .ex-btn.on{border-color:var(--ex-primary);color:var(--ex-primary)}
 .ex-btn.primary{background:var(--ex-primary);border-color:var(--ex-primary);color:hsl(var(--primary-foreground,0 0% 100%))}
 .ex-btn.danger{background:var(--ex-danger);border-color:var(--ex-danger);color:#fff}
+.ex-btn.danger-outline{background:transparent;border-color:var(--ex-danger);color:var(--ex-danger)}
 .ex-search{flex:1;min-width:0;position:relative}
 .ex-search .ex-ic{position:absolute;left:10px;top:9px;color:var(--ex-muted)}
 .ex-input{width:100%;height:36px;padding:0 10px 0 34px;border:1px solid var(--ex-border);border-radius:calc(var(--ex-r) - 2px);
@@ -197,7 +227,18 @@ background:currentColor;-webkit-text-fill-color:#fff;letter-spacing:.02em}
 .ex-pbody pre{align-self:stretch;width:100%;margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 'Geist Mono',ui-monospace,monospace}
 .ex-pbody .ex-empty{max-width:360px}
 .ex-hidden{display:none!important}
-@media (hover:hover){.ex-crumb:hover,.ex-btn:not(:disabled):hover,.ex-item:hover,.ex-menu button:hover{background:var(--ex-hover)}
+.ex-picker{display:flex;flex-direction:column;max-height:min(82vh,640px)}
+.ex-pcrumbs{display:flex;align-items:center;gap:2px;overflow-x:auto;scrollbar-width:none;white-space:nowrap;margin:0 0 6px}
+.ex-pcrumbs::-webkit-scrollbar{display:none}
+.ex-plist{flex:1;min-height:140px;overflow-y:auto;border:1px solid var(--ex-border);border-radius:calc(var(--ex-r) - 2px);margin-bottom:8px}
+.ex-prow{display:flex;align-items:center;gap:10px;padding:11px 12px;cursor:pointer;border-bottom:1px solid var(--ex-border)}
+.ex-prow:last-child{border-bottom:0}
+.ex-prow span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ex-prow:active{background:var(--ex-hover)}
+.ex-pnote{font-size:12px;min-height:16px;margin:0 2px 8px;color:var(--ex-muted)}
+.ex-pnote.bad{color:var(--ex-danger)}
+.ex-sheet .ex-acts{flex-wrap:wrap}
+@media (hover:hover){.ex-crumb:hover,.ex-btn:not(:disabled):hover,.ex-item:hover,.ex-menu button:hover,.ex-prow:hover{background:var(--ex-hover)}
 .ex-more:hover{background:var(--ex-card);color:var(--ex-fg)}}
 .ex-item:active,.ex-menu button:active{background:var(--ex-hover)}
 `;
@@ -444,19 +485,169 @@ export function mount(container, api) {
     return url;
   }
 
-  async function download(e) {
-    try {
-      const url = keepUrl(await fetchBlob(e));
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = e.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } catch (err) {
-      s.progress = null;
-      s.error = err.message;
+  function download(e) {
+    saveAs(directUrl('raw', { root: s.root, path: e.path ?? joinRel(s.cwd, e.name), download: '1' }), e.name);
+    s.error = '';
+    s.note = `Скачивание «${e.name}» — ход виден в загрузках браузера`;
+    renderStatus();
+  }
+
+  function downloadZip(e) {
+    const rel = e.path ?? joinRel(s.cwd, e.name);
+    saveAs(directUrl('zip', { root: s.root, path: rel, gitignore: s.gitignore ? '1' : '0', hidden: s.hidden ? '1' : '0' }), `${e.name}.zip`);
+    s.error = '';
+    s.note = `Архив «${e.name}.zip» собирается на лету и скачивается — ход виден в загрузках браузера`;
+    renderStatus();
+  }
+
+  // ── Copy / move ──
+
+  /** Folder picker: resolves to the chosen folder (relative path) or null. */
+  function pickFolder({ title, ok, start, invalid }) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div');
+      ov.className = 'ex-overlay';
+      ov.innerHTML = `<div class="ex-sheet ex-picker" role="dialog"><h3>${esc(title)}</h3>
+        <div class="ex-pcrumbs"></div><div class="ex-plist"></div><div class="ex-pnote"></div>
+        <div class="ex-acts"><button class="ex-btn" data-k="mkdir" title="Новая папка" aria-label="Новая папка">${icon('newFolder')}</button>
+        <span style="flex:1"></span><button class="ex-btn" data-k="cancel">Отмена</button>
+        <button class="ex-btn primary" data-k="ok">${esc(ok)}</button></div></div>`;
+      const crumbs = ov.querySelector('.ex-pcrumbs');
+      const plist = ov.querySelector('.ex-plist');
+      const note = ov.querySelector('.ex-pnote');
+      const okBtn = ov.querySelector('[data-k=ok]');
+      let cur = start;
+      let dirs = [];
+      const close = (val) => {
+        ov.remove();
+        resolve(val);
+      };
+      const draw = (err = '') => {
+        const parts = cur ? cur.split('/') : [];
+        const rootName = s.root.split('/').filter(Boolean).pop() || '/';
+        crumbs.innerHTML = `<button class="ex-crumb" data-go="">${icon('home')} ${esc(rootName)}</button>` + parts.map((p, i) =>
+          `<span class="ex-sep">/</span><button class="ex-crumb" data-go="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('');
+        crumbs.scrollLeft = crumbs.scrollWidth;
+        plist.innerHTML = dirs.length
+          ? dirs.map((d, i) => `<div class="ex-prow" data-i="${i}">${icon('folder', 'ex-k-dir')}<span>${esc(d.name)}</span></div>`).join('')
+          : `<div class="ex-empty" style="padding:24px 12px">${err ? esc(err) : 'Вложенных папок нет'}</div>`;
+        const why = invalid(cur);
+        okBtn.disabled = !!why || !!err;
+        note.className = `ex-pnote${why ? ' bad' : ''}`;
+        note.textContent = why || `Сюда: ${cur ? `/${cur}` : 'корень проекта'}`;
+      };
+      const go = async (rel) => {
+        plist.innerHTML = '<div class="ex-empty" style="padding:24px 12px">Загрузка…</div>';
+        try {
+          const d = await call('GET', 'list', { query: { root: s.root, path: rel, gitignore: s.gitignore ? '1' : '0' } });
+          cur = d.path;
+          dirs = d.entries
+            .filter((x) => x.type === 'dir' && (s.hidden || !x.name.startsWith('.')))
+            .sort((a, b) => a.name.localeCompare(b.name, 'ru', { numeric: true, sensitivity: 'base' }));
+          draw();
+        } catch (err) {
+          dirs = [];
+          draw(err.message);
+        }
+      };
+      ov.addEventListener('click', async (ev) => {
+        if (ev.target === ov) return close(null);
+        const c = ev.target.closest('[data-go]');
+        if (c) return go(c.dataset.go);
+        const row = ev.target.closest('.ex-prow');
+        if (row) return go(joinRel(cur, dirs[Number(row.dataset.i)].name));
+        const k = ev.target.closest('[data-k]')?.dataset.k;
+        if (k === 'cancel') return close(null);
+        if (k === 'ok' && !okBtn.disabled) return close(cur);
+        if (k === 'mkdir') {
+          const name = await ask({ title: 'Новая папка', value: 'Новая папка', ok: 'Создать' });
+          if (!name) return;
+          try {
+            const r = await call('POST', 'mkdir', { body: { root: s.root, path: cur, name } });
+            return go(r.path);
+          } catch (err) {
+            note.className = 'ex-pnote bad';
+            note.textContent = err.message;
+          }
+        }
+      });
+      ov.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') close(null);
+      });
+      el.appendChild(ov);
+      go(start);
+    });
+  }
+
+  async function transferItem(e, op) {
+    const rel = e.path ?? joinRel(s.cwd, e.name);
+    const from = parentOf(rel);
+    const isDir = e.type === 'dir';
+    const verb = op === 'copy' ? 'Копировать' : 'Перенести';
+    const dest = await pickFolder({
+      title: `${verb} «${e.name}» в…`,
+      ok: `${verb} сюда`,
+      start: s.cwd,
+      invalid: (d) => {
+        if (isDir && (d === rel || d.startsWith(`${rel}/`))) return 'Нельзя положить папку внутрь неё самой';
+        if (op === 'move' && d === from) return `«${e.name}» уже в этой папке`;
+        return '';
+      },
+    });
+    if (dest === null) return;
+    let conflict;
+    for (;;) {
+      try {
+        const { id } = await call('POST', 'transfer', { body: { root: s.root, op, path: rel, dest, conflict } });
+        return watchJob(id, op, e.name, dest);
+      } catch (err) {
+        if (err.conflict && !conflict) {
+          const choice = await dialog(`<h3>В папке уже есть «${esc(e.name)}»</h3>
+            <p>${err.canReplace ? 'Заменить файл в папке назначения или сохранить оба (новый получит номер)?' : 'Сохранить оба? Новый получит номер в имени.'}</p>
+            <div class="ex-acts"><button class="ex-btn" data-r="cancel">Отмена</button>
+            ${err.canReplace ? '<button class="ex-btn danger-outline" data-r="replace">Заменить</button>' : ''}
+            <button class="ex-btn primary" data-r="rename">Сохранить оба</button></div>`);
+          if (choice !== 'replace' && choice !== 'rename') return;
+          conflict = choice;
+          continue;
+        }
+        s.error = err.message;
+        renderStatus();
+        return;
+      }
+    }
+  }
+
+  async function watchJob(id, op, name, dest) {
+    const what = op === 'copy' ? 'Копирование' : 'Перенос';
+    s.error = '';
+    for (;;) {
+      let j;
+      try {
+        j = await call('GET', 'job', { query: { id } });
+      } catch (err) {
+        s.progress = null;
+        s.error = err.message;
+        renderStatus();
+        return;
+      }
+      if (j.status !== 'running') {
+        s.progress = null;
+        if (j.status === 'error') {
+          s.error = `${what} «${name}»: ${j.error}`;
+          renderStatus();
+          return;
+        }
+        if (s.results) await runSearch();
+        else await load(s.cwd, { keepScroll: true });
+        s.note = `«${name}» ${op === 'copy' ? 'скопировано' : 'перенесено'} в «${dest ? `/${dest}` : 'корень проекта'}»${j.path && !j.path.endsWith(`/${name}`) && j.path !== name ? ` как «${j.path.split('/').pop()}»` : ''}`;
+        renderStatus();
+        return;
+      }
+      const label = j.phase === 'cleanup' ? `${what} «${name}»: удаление исходника…` : `${what} «${name}»: ${j.done} из ${j.total}`;
+      s.progress = { label, pct: j.total > 1 ? Math.round((j.done / j.total) * 100) : null };
       renderStatus();
+      await new Promise((r) => setTimeout(r, 600));
     }
   }
 
@@ -505,7 +696,9 @@ export function mount(container, api) {
     const pick = await dialog(`<h3>${esc(e.name)}</h3>
       <p>${isDir ? 'Папка' : fmtSize(e.size)} · ${esc(fmtDate(e.mtime))}${s.results ? ` · ${esc(parentOf(e.path) || '/')}` : ''}</p>
       <div class="ex-menu">
-        ${isDir ? `<button data-r="open">${icon('folder')} Открыть</button>` : `<button data-r="preview">${icon('eye')} Просмотр</button><button data-r="download">${icon('download')} Скачать</button>`}
+        ${isDir ? `<button data-r="open">${icon('folder')} Открыть</button><button data-r="zip">${icon('zip')} Скачать ZIP</button>` : `<button data-r="preview">${icon('eye')} Просмотр</button><button data-r="download">${icon('download')} Скачать</button>`}
+        <button data-r="copyto">${icon('copyTo')} Копировать в…</button>
+        <button data-r="moveto">${icon('moveTo')} Перенести в…</button>
         ${s.results ? `<button data-r="reveal">${icon('folder')} Показать в папке</button>` : ''}
         <button data-r="copy">${icon('copy')} Копировать путь</button>
         <button data-r="rename">${icon('edit')} Переименовать</button>
@@ -515,6 +708,9 @@ export function mount(container, api) {
     if (pick === 'open') return load(rel);
     if (pick === 'preview') return preview(e);
     if (pick === 'download') return download(e);
+    if (pick === 'zip') return downloadZip(e);
+    if (pick === 'copyto') return transferItem(e, 'copy');
+    if (pick === 'moveto') return transferItem(e, 'move');
     if (pick === 'reveal') {
       inputEl.value = '';
       s.query = '';
