@@ -1,0 +1,19 @@
+README.md
+  s_fe1d6b44b0a5ba::t_66fbf66cbf7d21 41-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f1b4de7bbb58a2bc1ec9d66a649246af61a0b1ea",
+  "prompts": {},
+  "sessions": {
+    "s_fe1d6b44b0a5ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5156527-572e-4b9d-89c4-498d77a9d14a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Javidan Sadygov <jav1dan@live.com>"
+    }
+  }
+}
