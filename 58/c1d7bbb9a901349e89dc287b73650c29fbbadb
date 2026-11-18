@@ -1,0 +1,31 @@
+dist/server.js
+  s_fe1d6b44b0a5ba::t_c8c55a1aa2f0b9 1-381
+dist/index.js
+  s_fe1d6b44b0a5ba::t_626f24983602d7 1-168,171-173,176-769
+  s_fe1d6b44b0a5ba::t_6b9533019dea9d 169-170,174-175
+  s_fe1d6b44b0a5ba::t_a7f6701ae70269 770-772
+.gitignore
+  s_fe1d6b44b0a5ba::t_73211769eb6576 1
+README.md
+  s_fe1d6b44b0a5ba::t_bc035a1170bce6 1-37
+icon.svg
+  s_fe1d6b44b0a5ba::t_5653ffd2aff6cb 1
+manifest.json
+  s_fe1d6b44b0a5ba::t_f8f3d7edab4a7d 1-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "58c1d7bbb9a901349e89dc287b73650c29fbbadb",
+  "prompts": {},
+  "sessions": {
+    "s_fe1d6b44b0a5ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5156527-572e-4b9d-89c4-498d77a9d14a",
+        "model": "unknown"
+      },
+      "human_author": "Javidan Sadygov <jav1dan@live.com>"
+    }
+  }
+}
