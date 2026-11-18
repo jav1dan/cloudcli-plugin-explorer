@@ -10,6 +10,11 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+
+// Vendored `ignore` 7.0.16 (MIT, see vendor/ignore.LICENSE-MIT), the matcher
+// CloudCLI itself uses, so the plugin installs without `npm install`.
+const ignore = createRequire(import.meta.url)('./vendor/ignore.cjs');
 
 const SEARCH_DEFAULT_LIMIT = 200;
 const SEARCH_MAX_LIMIT = 1000;
@@ -83,6 +88,66 @@ function fsError(err) {
   }
 }
 
+// ── .gitignore ───────────────────────────────────────────────────────────
+// Git semantics: every .gitignore from the project root down to the folder
+// applies, each relative to its own folder, and a deeper file may re-include
+// (`!pattern`) what a shallower one excluded.
+
+const GITIGNORE_CACHE_MAX = 5000;
+const gitignoreCache = new Map(); // folder → { mtime, size, ig }
+
+async function gitignoreIn(dir) {
+  let st;
+  try {
+    st = await fsp.stat(path.join(dir, '.gitignore'));
+  } catch {
+    gitignoreCache.delete(dir);
+    return null;
+  }
+  if (!st.isFile()) return null;
+  const hit = gitignoreCache.get(dir);
+  if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit.ig;
+  let ig = null;
+  try {
+    ig = ignore().add(await fsp.readFile(path.join(dir, '.gitignore'), 'utf8'));
+  } catch { /* unreadable: ignore nothing */ }
+  if (gitignoreCache.size >= GITIGNORE_CACHE_MAX) gitignoreCache.clear();
+  gitignoreCache.set(dir, { mtime: st.mtimeMs, size: st.size, ig });
+  return ig;
+}
+
+/** Matchers that apply inside `dir`: the root's .gitignore first, `dir`'s own last. */
+async function matchersFor(root, dir) {
+  const parts = relOf(root, dir).split('/').filter(Boolean);
+  const out = [];
+  let cur = root;
+  for (let i = 0; i <= parts.length; i++) {
+    if (i) cur = path.join(cur, parts[i - 1]);
+    const ig = await gitignoreIn(cur);
+    if (ig) out.push({ base: cur, ig });
+  }
+  return out;
+}
+
+async function withOwnMatcher(parentMatchers, dir) {
+  const ig = await gitignoreIn(dir);
+  return ig ? [...parentMatchers, { base: dir, ig }] : parentMatchers;
+}
+
+function isIgnored(matchers, abs, isDir) {
+  let ignored = false;
+  for (const { base, ig } of matchers) {
+    const rel = path.relative(base, abs).split(path.sep).join('/');
+    if (!rel || rel.startsWith('..')) continue;
+    const t = ig.test(isDir ? `${rel}/` : rel);
+    if (t.ignored) ignored = true;
+    else if (t.unignored) ignored = false;
+  }
+  return ignored;
+}
+
+const wantsGitignore = (v) => v !== '0' && v !== false && v !== 0;
+
 /** One directory entry, following symlinks so a link to a folder opens as a folder. */
 async function describe(dir, name) {
   const abs = path.join(dir, name);
@@ -123,8 +188,17 @@ async function list(q) {
   } catch (err) {
     throw fsError(err);
   }
-  const entries = (await Promise.all(names.map((n) => describe(abs, n)))).filter(Boolean);
-  return { path: relOf(root, abs), entries };
+  let entries = (await Promise.all(names.map((n) => describe(abs, n)))).filter(Boolean);
+  let ignored = 0;
+  if (wantsGitignore(q.get('gitignore'))) {
+    const matchers = await matchersFor(root, abs);
+    if (matchers.length) {
+      const kept = entries.filter((e) => !isIgnored(matchers, path.join(abs, e.name), e.type === 'dir'));
+      ignored = entries.length - kept.length;
+      entries = kept;
+    }
+  }
+  return { path: relOf(root, abs), entries, ignored };
 }
 
 /** Breadth-first name search under `path`, bounded by result count, time and visited entries. */
@@ -135,9 +209,12 @@ async function search(q) {
   if (!terms.length) throw new HttpError(400, 'Пустой запрос.');
   const limit = Math.min(Math.max(Number(q.get('limit')) || SEARCH_DEFAULT_LIMIT, 1), SEARCH_MAX_LIMIT);
   const showHidden = q.get('hidden') === '1';
+  const useGitignore = wantsGitignore(q.get('gitignore'));
   const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
   const seen = new Set();
-  const queue = [start];
+  // A queued folder carries its ancestors' matchers; its own .gitignore is added on visit.
+  const startMatchers = useGitignore && start !== root ? await matchersFor(root, path.dirname(start)) : [];
+  const queue = [{ dir: start, matchers: startMatchers }];
   const results = [];
   let visited = 0;
   let incomplete = false;
@@ -147,7 +224,8 @@ async function search(q) {
       incomplete = true;
       break;
     }
-    const dir = queue.shift();
+    const { dir, matchers: parentMatchers } = queue.shift();
+    const matchers = useGitignore ? await withOwnMatcher(parentMatchers, dir) : parentMatchers;
     let real;
     try {
       real = await fsp.realpath(dir);
@@ -174,13 +252,15 @@ async function search(q) {
           isDir = false;
         }
       }
+      // An ignored folder is skipped whole, like git does: nothing under it is searched.
+      if (matchers.length && isIgnored(matchers, abs, isDir)) continue;
       const lower = d.name.toLocaleLowerCase('ru');
       if (terms.every((t) => lower.includes(t))) {
         const item = await describe(dir, d.name);
         if (item) results.push({ ...item, path: relOf(root, abs) });
         if (results.length >= limit) break;
       }
-      if (isDir && !SKIP_IN_SEARCH.has(d.name)) queue.push(abs);
+      if (isDir && !SKIP_IN_SEARCH.has(d.name)) queue.push({ dir: abs, matchers });
     }
   }
   return { results, incomplete, visited };

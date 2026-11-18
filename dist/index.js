@@ -114,6 +114,7 @@ const P = {
   trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
   home: '<path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/>',
   link: '<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
+  git: '<circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="9" r="2.2"/><path d="M6 8.2v7.6M18 11.2c0 3-3 3.8-6 4.3-2 .3-4 .9-5.2 1.6"/>',
 };
 const icon = (name, cls = '') => `<svg class="ex-ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name]}</svg>`;
 
@@ -154,7 +155,7 @@ background:var(--ex-card);color:var(--ex-fg);border-radius:calc(var(--ex-r) - 2p
 .ex-input{width:100%;height:36px;padding:0 10px 0 34px;border:1px solid var(--ex-border);border-radius:calc(var(--ex-r) - 2px);
 background:var(--ex-card);color:var(--ex-fg);font:inherit;font-size:16px;outline:none}
 .ex-input:focus{border-color:var(--ex-primary)}
-.ex-select{height:36px;border:1px solid var(--ex-border);border-radius:calc(var(--ex-r) - 2px);background:var(--ex-card);color:var(--ex-fg);font:inherit;padding:0 6px;flex:none}
+.ex-select{height:36px;border:1px solid var(--ex-border);border-radius:calc(var(--ex-r) - 2px);background:var(--ex-card);color:var(--ex-fg);font:inherit;padding:0 6px;flex:0 1 auto;min-width:0;max-width:170px}
 .ex-status{font-size:12px;color:var(--ex-muted);min-height:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .ex-status .err{color:var(--ex-danger)}
 .ex-bar{height:3px;background:var(--ex-border);border-radius:2px;overflow:hidden;flex:1;min-width:80px}
@@ -213,6 +214,8 @@ export function mount(container, api) {
     query: '',
     sort: store.get('sort', 'name'),
     hidden: store.get('hidden', false),
+    gitignore: store.get('gitignore', true),
+    ignoredCount: 0,
     loading: false,
     error: '',
     note: '',
@@ -238,6 +241,7 @@ export function mount(container, api) {
           <option value="name">По имени</option><option value="mtime">Сначала новые</option><option value="size">Сначала большие</option>
         </select>
         <span style="flex:1"></span>
+        <button class="ex-btn" data-a="gitignore" title="Учитывать .gitignore" aria-label="Учитывать .gitignore">${icon('git')}</button>
         <button class="ex-btn" data-a="hidden" title="Скрытые файлы" aria-label="Скрытые файлы"></button>
         <button class="ex-btn" data-a="mkdir" title="Новая папка" aria-label="Новая папка">${icon('newFolder')}</button>
         <button class="ex-btn" data-a="upload" title="Загрузить файлы" aria-label="Загрузить">${icon('upload')}</button>
@@ -304,7 +308,7 @@ export function mount(container, api) {
     } else if (s.root) {
       const items = visible();
       const dirs = items.filter((e) => e.type === 'dir').length;
-      bits.push(`<span>${s.results ? 'Найдено' : 'Папок'}: ${s.results ? items.length : `${dirs}, файлов: ${items.length - dirs}`}</span>`);
+      bits.push(`<span>${s.results ? 'Найдено' : 'Папок'}: ${s.results ? items.length : `${dirs}, файлов: ${items.length - dirs}`}${!s.results && s.ignoredCount ? ` · скрыто по .gitignore: ${s.ignoredCount}` : ''}</span>`);
     }
     statusEl.innerHTML = bits.join('');
   }
@@ -340,6 +344,8 @@ export function mount(container, api) {
   function render() {
     $('[data-a=hidden]').innerHTML = icon(s.hidden ? 'eye' : 'eyeOff');
     $('[data-a=hidden]').classList.toggle('on', s.hidden);
+    $('[data-a=gitignore]').classList.toggle('on', s.gitignore);
+    $('[data-a=gitignore]').title = s.gitignore ? 'Учитывается .gitignore — нажмите, чтобы показать всё' : '.gitignore не учитывается — нажмите, чтобы учитывать';
     renderCrumbs();
     renderStatus();
     renderList();
@@ -359,10 +365,11 @@ export function mount(container, api) {
     s.results = null;
     render();
     try {
-      const data = await call('GET', 'list', { query: { root: s.root, path: rel }, signal: ac.signal });
+      const data = await call('GET', 'list', { query: { root: s.root, path: rel, gitignore: s.gitignore ? '1' : '0' }, signal: ac.signal });
       if (seq !== s.seq) return;
       s.cwd = data.path;
       s.entries = data.entries;
+      s.ignoredCount = data.ignored || 0;
       s.shown = PAGE;
       store.set(cwdKey(), s.cwd);
     } catch (err) {
@@ -394,7 +401,7 @@ export function mount(container, api) {
     s.results = [];
     render();
     try {
-      const data = await call('GET', 'search', { query: { root: s.root, path: s.cwd, q, hidden: s.hidden ? '1' : '0' }, signal: ac.signal });
+      const data = await call('GET', 'search', { query: { root: s.root, path: s.cwd, q, hidden: s.hidden ? '1' : '0', gitignore: s.gitignore ? '1' : '0' }, signal: ac.signal });
       if (seq !== s.seq) return;
       s.results = data.results;
       s.shown = PAGE;
@@ -689,6 +696,11 @@ export function mount(container, api) {
         s.hidden = !s.hidden;
         store.set('hidden', s.hidden);
         return render();
+      }
+      if (act === 'gitignore') {
+        s.gitignore = !s.gitignore;
+        store.set('gitignore', s.gitignore);
+        return s.results ? runSearch() : load(s.cwd, { keepScroll: true });
       }
       if (act === 'upload') return fileEl.click();
       if (act === 'mkdir') {
