@@ -1,0 +1,19 @@
+README.md
+  s_fe1d6b44b0a5ba::t_25786790d687ca 3-41,45-47,53,56-57,60-68,70,72-88,91-92,94,96-100,102-103,105-112,118-127,130-133,142-144,149,154-164,167-220,224-226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "70d84c922e78a52c0118d36df243c0d01d76f49a",
+  "prompts": {},
+  "sessions": {
+    "s_fe1d6b44b0a5ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5156527-572e-4b9d-89c4-498d77a9d14a",
+        "model": "unknown"
+      },
+      "human_author": "Javidan Sadygov <jav1dan@live.com>"
+    }
+  }
+}
