@@ -11,6 +11,9 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { pipeline, Transform } from 'node:stream';
 import { createRequire } from 'node:module';
 
@@ -794,6 +797,203 @@ async function jobStatus(q) {
   return { id, op, name, status, phase, done, total, error, path: target };
 }
 
+// ── Preview conversion ───────────────────────────────────────────────────
+// Formats a browser cannot show are converted on the server and cached by file
+// path + size + mtime: office documents to PDF (LibreOffice), DWG/DXF to SVG
+// (LibreDWG dwg2dxf + tools/dxf2svg.py on ezdxf), TIFF/HEIC/PSD to JPEG
+// (ImageMagick). A conversion that outlasts PREVIEW_WAIT_MS answers 202 so the
+// request stays under Cloudflare's 100 s limit; the client asks again and gets
+// the same running conversion.
+
+const OFFICE = new Set(['doc', 'docx', 'docm', 'dot', 'dotx', 'rtf', 'odt', 'ott', 'xls', 'xlsx', 'xlsm', 'xlsb', 'ods',
+  'ppt', 'pptx', 'pps', 'ppsx', 'odp', 'odg', 'vsd', 'vsdx']);
+const CAD = new Set(['dwg', 'dxf']);
+const RASTER = new Set(['tif', 'tiff', 'heic', 'heif', 'psd']);
+const PREVIEW_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'cloudcli-explorer', 'preview');
+const PREVIEW_MAX_INPUT = 300 * 1024 * 1024;
+const PREVIEW_WAIT_MS = 45_000;
+const PREVIEW_TIMEOUT_MS = 3 * 60_000;
+const PREVIEW_FAIL_TTL_MS = 10 * 60_000;
+const PREVIEW_CACHE_MAX = 2 * 1024 ** 3;
+const DXF2SVG = fileURLToPath(new URL('./tools/dxf2svg.py', import.meta.url));
+
+/** Runs at most `n` tasks at once; LibreOffice gets 1 because it shares a profile. */
+function limiter(n) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= n || !queue.length) return;
+    active++;
+    const { task, resolve, reject } = queue.shift();
+    task().then(resolve, reject).finally(() => {
+      active--;
+      next();
+    });
+  };
+  return (task) => new Promise((resolve, reject) => {
+    queue.push({ task, resolve, reject });
+    next();
+  });
+}
+const officeSlot = limiter(1);
+const otherSlot = limiter(2);
+
+/** Runs a converter in its own process group so a timeout kills its children too. */
+function run(cmd, args, { cwd, timeout = PREVIEW_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', (c) => {
+      if (err.length < 4000) err += c;
+    });
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch { /* already gone */ }
+      reject(new HttpError(504, 'Превью не успело построиться за 3 минуты.'));
+    }, timeout);
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(new HttpError(501, e.code === 'ENOENT' ? `На сервере не установлен ${cmd}.` : e.message));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new HttpError(422, `${path.basename(cmd)} завершился с ошибкой ${code}. ${err.trim().split('\n').pop() || ''}`.trim()));
+    });
+  });
+}
+
+async function convert(abs, ext, out) {
+  const tmp = await fsp.mkdtemp(path.join(PREVIEW_DIR, 'tmp-'));
+  try {
+    // Converters get a plain ASCII name: ImageMagick reads `[`/`:` in names as syntax.
+    const input = path.join(tmp, `in.${ext}`);
+    await fsp.symlink(abs, input);
+    let made;
+    if (OFFICE.has(ext)) {
+      await officeSlot(() => run('soffice', [
+        `-env:UserInstallation=file://${path.join(PREVIEW_DIR, 'lo-profile')}`,
+        '--headless', '--norestore', '--nolockcheck', '--convert-to', 'pdf', '--outdir', tmp, input,
+      ], { cwd: tmp }));
+      made = path.join(tmp, 'in.pdf');
+    } else if (CAD.has(ext)) {
+      await otherSlot(async () => {
+        let dxf = input;
+        if (ext === 'dwg') {
+          dxf = path.join(tmp, 'in.dxf');
+          await run('dwg2dxf', ['-y', '-o', dxf, input], { cwd: tmp });
+        }
+        await run('python3', [DXF2SVG, dxf, path.join(tmp, 'out.svg')], { cwd: tmp });
+      }).catch((err) => {
+        // LibreDWG reads most but not all DWG files; the converter's stderr means nothing to a user.
+        if (err.status === 422) throw new HttpError(422, 'Этот чертёж не удалось отрисовать на сервере — LibreDWG читает не все DWG. Скачайте его и откройте в AutoCAD.');
+        throw err;
+      });
+      made = path.join(tmp, 'out.svg');
+    } else {
+      await otherSlot(() => run('magick', [`${input}[0]`, '-auto-orient', '-resize', '3000x3000>', '-quality', '85',
+        path.join(tmp, 'out.jpg')], { cwd: tmp }));
+      made = path.join(tmp, 'out.jpg');
+    }
+    try {
+      if (!(await fsp.stat(made)).size) throw new Error('empty');
+    } catch {
+      throw new HttpError(422, 'Не удалось построить превью этого файла.');
+    }
+    await fsp.rename(made, out);
+  } finally {
+    fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
+  trimPreviewCache().catch(() => {});
+}
+
+/** Keeps the cache under PREVIEW_CACHE_MAX, dropping the least recently viewed. */
+async function trimPreviewCache() {
+  const files = [];
+  let total = 0;
+  for (const d of await fsp.readdir(PREVIEW_DIR, { withFileTypes: true })) {
+    if (!d.isFile()) continue;
+    const st = await fsp.stat(path.join(PREVIEW_DIR, d.name)).catch(() => null);
+    if (!st) continue;
+    files.push({ p: path.join(PREVIEW_DIR, d.name), used: st.mtimeMs, size: st.size });
+    total += st.size;
+  }
+  files.sort((a, b) => a.used - b.used);
+  for (const f of files) {
+    if (total <= PREVIEW_CACHE_MAX * 0.75) break;
+    await fsp.rm(f.p, { force: true });
+    total -= f.size;
+  }
+}
+
+// Work folders of conversions cut short by a restart.
+fsp.readdir(PREVIEW_DIR).then((names) => names.filter((n) => n.startsWith('tmp-'))
+  .forEach((n) => fsp.rm(path.join(PREVIEW_DIR, n), { recursive: true, force: true }).catch(() => {}))).catch(() => {});
+
+const conversions = new Map(); // cache key → { promise, failed, error, at }
+
+async function sendPreview(q, res) {
+  const root = requireRoot(q.get('root'));
+  const abs = inside(root, q.get('path') || '');
+  let st;
+  try {
+    st = await fsp.stat(abs);
+  } catch (err) {
+    throw fsError(err);
+  }
+  if (!st.isFile()) throw new HttpError(400, 'Это не файл.');
+  const ext = extOf(abs);
+  const outExt = OFFICE.has(ext) ? 'pdf' : CAD.has(ext) ? 'svg' : RASTER.has(ext) ? 'jpg' : null;
+  if (!outExt) throw new HttpError(415, 'Для этого типа файла превью не строится.');
+  if (st.size > PREVIEW_MAX_INPUT) throw new HttpError(413, 'Файл слишком большой для превью — скачайте его.');
+
+  await fsp.mkdir(PREVIEW_DIR, { recursive: true, mode: 0o700 });
+  const key = crypto.createHash('sha1').update(`${abs}\0${st.size}\0${st.mtimeMs}`).digest('hex');
+  const out = path.join(PREVIEW_DIR, `${key}.${outExt}`);
+
+  let ready = await fsp.stat(out).catch(() => null);
+  if (!ready) {
+    let c = conversions.get(key);
+    if (c?.failed && Date.now() - c.at > PREVIEW_FAIL_TTL_MS) c = null;
+    if (!c) {
+      c = { failed: false, error: null, at: Date.now() };
+      c.promise = convert(abs, ext, out).then(
+        () => conversions.delete(key),
+        (err) => Object.assign(c, { failed: true, error: err, at: Date.now() }),
+      );
+      conversions.set(key, c);
+    }
+    if (!c.failed) {
+      let timer;
+      await Promise.race([c.promise, new Promise((r) => { timer = setTimeout(r, PREVIEW_WAIT_MS); })]);
+      clearTimeout(timer);
+    }
+    if (c.failed) throw c.error instanceof HttpError ? c.error : new HttpError(422, c.error?.message || 'Не удалось построить превью.');
+    ready = await fsp.stat(out).catch(() => null);
+    if (!ready) {
+      res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ pending: true }));
+      return;
+    }
+  }
+  const now = new Date();
+  fsp.utimes(out, now, now).catch(() => {}); // mtime = last viewed, for trimPreviewCache
+  res.writeHead(200, {
+    'Content-Type': outExt === 'pdf' ? 'application/pdf' : outExt === 'svg' ? 'image/svg+xml' : 'image/jpeg',
+    'Content-Length': ready.size,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Preview-Type': outExt,
+  });
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(out);
+    stream.on('error', reject);
+    res.on('close', resolve);
+    stream.pipe(res);
+  });
+}
+
 // ── HTTP wiring ──────────────────────────────────────────────────────────
 
 const GET = { '/list': list, '/search': search, '/job': jobStatus };
@@ -822,6 +1022,10 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/raw') {
       await sendRaw(url.searchParams, res);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/preview') {
+      await sendPreview(url.searchParams, res);
       return;
     }
     if (req.method === 'GET' && url.pathname === '/zip') {

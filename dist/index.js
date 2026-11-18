@@ -14,9 +14,14 @@ const BLOB_PREVIEW_MAX = 200 * 1024 * 1024;
 const IMAGE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico']);
 const VIDEO = new Set(['mp4', 'webm']);
 const AUDIO = new Set(['mp3', 'wav', 'ogg']);
-const TEXT = new Set(['txt', 'md', 'csv', 'log', 'json', 'xml', 'html', 'js', 'ts', 'py', 'sh', 'yml', 'yaml', 'ini', 'dxf']);
+const TEXT = new Set(['txt', 'md', 'csv', 'log', 'json', 'xml', 'html', 'js', 'ts', 'py', 'sh', 'yml', 'yaml', 'ini']);
+// Converted on the server for preview (see sendPreview in server.js): office → PDF,
+// DWG/DXF → SVG, TIFF/HEIC/PSD → JPEG.
+const CONVERT = new Set(['doc', 'docx', 'docm', 'dot', 'dotx', 'rtf', 'odt', 'ott', 'xls', 'xlsx', 'xlsm', 'xlsb', 'ods',
+  'ppt', 'pptx', 'pps', 'ppsx', 'odp', 'odg', 'vsd', 'vsdx', 'dwg', 'dxf', 'tif', 'tiff', 'heic', 'heif', 'psd']);
+const PREVIEW_CONVERT_MAX = 300 * 1024 * 1024;
 const KIND = {
-  pdf: 'pdf', doc: 'doc', docx: 'doc', rtf: 'doc', odt: 'doc', xls: 'xls', xlsx: 'xls', ods: 'xls', csv: 'xls',
+  pdf: 'pdf', ppt: 'ppt', pptx: 'ppt', odp: 'ppt', tif: 'img', tiff: 'img', heic: 'img', psd: 'img', doc: 'doc', docx: 'doc', rtf: 'doc', odt: 'doc', xls: 'xls', xlsx: 'xls', ods: 'xls', csv: 'xls',
   dwg: 'cad', dxf: 'cad', ifc: 'cad', zip: 'zip', rar: 'zip', '7z': 'zip', gz: 'zip', tar: 'zip',
 };
 
@@ -80,7 +85,7 @@ async function call(method, route, { query, body, signal } = {}) {
       localStorage.setItem('auth-token', refreshed);
     } catch { /* storage unavailable */ }
   }
-  if (route === 'raw' && res.ok) return res;
+  if ((route === 'raw' || route === 'preview') && res.status === 200) return res;
   let data = null;
   try {
     data = await res.json();
@@ -143,6 +148,11 @@ const P = {
   zip: '<path d="M21 8v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M10 12h4"/>',
   copyTo: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/><path d="M12 14.5h5M14.5 12v5"/>',
   moveTo: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 13h6M13 10.5l2.5 2.5-2.5 2.5"/>',
+  prev: '<path d="m15 18-6-6 6-6"/>',
+  next: '<path d="m9 18 6-6-6-6"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   git: '<circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="9" r="2.2"/><path d="M6 8.2v7.6M18 11.2c0 3-3 3.8-6 4.3-2 .3-4 .9-5.2 1.6"/>',
 };
 const icon = (name, cls = '') => `<svg class="ex-ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name]}</svg>`;
@@ -201,7 +211,7 @@ background:var(--ex-card);color:var(--ex-fg);font:inherit;font-size:16px;outline
 background:currentColor;-webkit-text-fill-color:#fff;letter-spacing:.02em}
 .ex-k-dir{color:hsl(38 80% 58%)}
 .ex-k-pdf{color:hsl(4 70% 58%)} .ex-k-doc{color:hsl(214 75% 60%)} .ex-k-xls{color:hsl(142 50% 45%)}
-.ex-k-cad{color:hsl(280 50% 65%)} .ex-k-zip{color:hsl(30 60% 55%)} .ex-k-img{color:hsl(190 60% 50%)}
+.ex-k-cad{color:hsl(280 50% 65%)} .ex-k-ppt{color:hsl(20 80% 58%)} .ex-k-zip{color:hsl(30 60% 55%)} .ex-k-img{color:hsl(190 60% 50%)}
 .ex-item .ex-linkic{width:13px;height:13px;vertical-align:-2px;opacity:.7}
 .ex-crumb{display:inline-flex;align-items:center;gap:4px}
 .ex-more{border:0;background:none;color:var(--ex-muted);width:40px;height:40px;border-radius:8px;cursor:pointer;flex:none;display:inline-flex;align-items:center;justify-content:center}
@@ -221,8 +231,19 @@ background:currentColor;-webkit-text-fill-color:#fff;letter-spacing:.02em}
 .ex-preview{position:absolute;inset:0;z-index:15;background:var(--ex-bg);display:flex;flex-direction:column}
 .ex-preview .ex-head{flex-direction:row;align-items:center}
 .ex-ptitle{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ex-pbody{flex:1;min-height:0;overflow:auto;display:flex;align-items:center;justify-content:center;padding:8px}
-.ex-pbody img,.ex-pbody video{max-width:100%;max-height:100%;object-fit:contain}
+.ex-pbody{position:relative;flex:1;min-height:0;overflow:auto;display:flex;align-items:center;justify-content:center;padding:8px}
+.ex-pbody video{max-width:100%;max-height:100%;object-fit:contain}
+.ex-pcount{color:var(--ex-muted);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.ex-zoom{position:absolute;inset:0;overflow:hidden;touch-action:none;cursor:zoom-in;user-select:none;-webkit-user-select:none}
+.ex-zoom.zoomed{cursor:grab}
+.ex-zoom.dragging{cursor:grabbing}
+.ex-zoom img{position:absolute;max-width:none;max-height:none;-webkit-user-drag:none;pointer-events:none}
+.ex-zoom.light{background:#fff}
+.ex-ztools{position:absolute;right:12px;bottom:12px;display:flex;gap:4px;padding:4px;border-radius:10px;background:var(--ex-card);border:1px solid var(--ex-border);box-shadow:0 2px 10px rgba(0,0,0,.15)}
+.ex-ztools .ex-btn{width:36px;height:36px}
+.ex-pwait{display:flex;flex-direction:column;align-items:center;gap:10px;color:var(--ex-muted);text-align:center}
+.ex-spin{width:22px;height:22px;border:2px solid var(--ex-border);border-top-color:var(--ex-fg);border-radius:50%;animation:ex-spin .9s linear infinite}
+@keyframes ex-spin{to{transform:rotate(360deg)}}
 .ex-pbody iframe{width:100%;height:100%;border:0;background:#fff;border-radius:6px}
 .ex-pbody pre{align-self:stretch;width:100%;margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 'Geist Mono',ui-monospace,monospace}
 .ex-pbody .ex-empty{max-width:360px}
@@ -456,27 +477,6 @@ export function mount(container, api) {
     }
     render();
     listEl.scrollTop = 0;
-  }
-
-  /** Fetches a file as a Blob, reporting download progress in the status line. */
-  async function fetchBlob(e) {
-    const res = await call('GET', 'raw', { query: { root: s.root, path: e.path ?? joinRel(s.cwd, e.name) } });
-    const total = Number(res.headers.get('Content-Length')) || 0;
-    if (!res.body || !total) return res.blob();
-    const reader = res.body.getReader();
-    const chunks = [];
-    let got = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      got += value.length;
-      s.progress = { label: `Загрузка «${e.name}» ${fmtSize(got)} из ${fmtSize(total)}`, pct: Math.round((got / total) * 100) };
-      renderStatus();
-    }
-    s.progress = null;
-    renderStatus();
-    return new Blob(chunks, { type: res.headers.get('Content-Type') || 'application/octet-stream' });
   }
 
   function keepUrl(blob) {
@@ -764,55 +764,310 @@ export function mount(container, api) {
 
   // ── Preview ──
 
-  async function preview(e) {
+  function previewKind(e) {
+    if (e.type === 'dir') return null;
+    const ext = e.ext || '';
+    if (CONVERT.has(ext)) return e.size <= PREVIEW_CONVERT_MAX ? 'convert' : null;
+    if (e.size === null || e.size > BLOB_PREVIEW_MAX) return null;
+    if (IMAGE.has(ext)) return 'image';
+    if (VIDEO.has(ext)) return 'video';
+    if (AUDIO.has(ext)) return 'audio';
+    if (ext === 'pdf') return 'pdf';
+    if (TEXT.has(ext) && e.size <= TEXT_PREVIEW_MAX) return 'text';
+    return null;
+  }
+
+  /** Reads a response body into a Blob, reporting progress in the status line. */
+  async function readBlob(res, label) {
+    const total = Number(res.headers.get('Content-Length')) || 0;
+    const type = res.headers.get('Content-Type') || 'application/octet-stream';
+    if (!res.body || !total) return res.blob();
+    const reader = res.body.getReader();
+    const chunks = [];
+    let got = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        s.progress = { label: `${label} ${fmtSize(got)} из ${fmtSize(total)}`, pct: Math.round((got / total) * 100) };
+        renderStatus();
+      }
+    } finally {
+      s.progress = null;
+      renderStatus();
+    }
+    return new Blob(chunks, { type });
+  }
+
+  /**
+   * Pan and zoom for one image: wheel or pinch zooms around the pointer, drag pans,
+   * double click toggles. The image is resized in layout (not CSS-scaled) so SVG
+   * drawings stay sharp at any zoom.
+   */
+  function zoomView(host, img, { onSwipe } = {}) {
+    let base = { w: 0, h: 0 };
+    let k = 1;
+    let x = 0;
+    let y = 0;
+    const pts = new Map();
+    let gesture = null;
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    function fit() {
+      const W = host.clientWidth - 16;
+      const H = host.clientHeight - 16;
+      const nw = img.naturalWidth || W;
+      const nh = img.naturalHeight || H;
+      // Vector drawings may be enlarged to fill the view; photos never above 100 %.
+      const f = Math.min(W / nw, H / nh, img.dataset.vector ? Infinity : 1);
+      base = { w: nw * f, h: nh * f };
+      apply();
+    }
+    function apply() {
+      const w = base.w * k;
+      const h = base.h * k;
+      const mx = Math.max(0, (w - host.clientWidth) / 2 + 24);
+      const my = Math.max(0, (h - host.clientHeight) / 2 + 24);
+      x = clamp(x, -mx, mx);
+      y = clamp(y, -my, my);
+      img.style.width = `${w}px`;
+      img.style.height = `${h}px`;
+      img.style.left = `${host.clientWidth / 2 + x - w / 2}px`;
+      img.style.top = `${host.clientHeight / 2 + y - h / 2}px`;
+      host.classList.toggle('zoomed', k > 1.01);
+    }
+    function zoomAt(f, cx, cy) {
+      const r = host.getBoundingClientRect();
+      const px = (cx ?? r.left + r.width / 2) - r.left - r.width / 2;
+      const py = (cy ?? r.top + r.height / 2) - r.top - r.height / 2;
+      const nk = clamp(k * f, 1, 60);
+      x = px - ((px - x) * nk) / k;
+      y = py - ((py - y) * nk) / k;
+      k = nk;
+      if (k === 1) x = y = 0;
+      apply();
+    }
+    host.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      zoomAt(Math.exp(-ev.deltaY * (ev.ctrlKey ? 0.01 : 0.0025)), ev.clientX, ev.clientY);
+    }, { passive: false });
+    host.addEventListener('pointerdown', (ev) => {
+      host.setPointerCapture(ev.pointerId);
+      pts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      gesture = { x0: ev.clientX, y0: ev.clientY, multi: gesture?.multi || pts.size > 1 };
+      if (pts.size > 1) gesture.multi = true;
+    });
+    host.addEventListener('pointermove', (ev) => {
+      const p = pts.get(ev.pointerId);
+      if (!p) return;
+      if (pts.size === 2) {
+        const [a, b] = [...pts.values()];
+        const d0 = Math.hypot(a.x - b.x, a.y - b.y);
+        p.x = ev.clientX;
+        p.y = ev.clientY;
+        const [c, d] = [...pts.values()];
+        const d1 = Math.hypot(c.x - d.x, c.y - d.y);
+        if (d0 > 0) zoomAt(d1 / d0, (c.x + d.x) / 2, (c.y + d.y) / 2);
+        return;
+      }
+      if (k > 1) {
+        x += ev.clientX - p.x;
+        y += ev.clientY - p.y;
+        host.classList.add('dragging');
+        apply();
+      }
+      p.x = ev.clientX;
+      p.y = ev.clientY;
+    });
+    const up = (ev) => {
+      if (!pts.delete(ev.pointerId)) return;
+      host.classList.remove('dragging');
+      if (pts.size || !gesture) return;
+      const dx = ev.clientX - gesture.x0;
+      const dy = ev.clientY - gesture.y0;
+      if (!gesture.multi && k === 1 && ev.pointerType !== 'mouse' && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) onSwipe?.(dx < 0 ? 1 : -1);
+      gesture = null;
+    };
+    host.addEventListener('pointerup', up);
+    host.addEventListener('pointercancel', up);
+    host.addEventListener('dblclick', (ev) => (k > 1.01 ? ((k = 1), (x = y = 0), apply()) : zoomAt(3, ev.clientX, ev.clientY)));
+    const ro = new ResizeObserver(fit);
+    ro.observe(host);
+    if (img.complete) fit();
+    else img.addEventListener('load', fit, { once: true });
+    return { zoomAt, reset: () => ((k = 1), (x = y = 0), apply()), destroy: () => ro.disconnect() };
+  }
+
+  /** Full-panel viewer; ‹ › (arrows, swipe) walk the previewable files of the list. */
+  function preview(start) {
+    let list = s.view.filter((x) => previewKind(x));
+    let idx = list.indexOf(start);
+    if (idx < 0) {
+      list = [start];
+      idx = 0;
+    }
     const pv = document.createElement('div');
     pv.className = 'ex-preview';
+    pv.tabIndex = -1;
     pv.innerHTML = `<div class="ex-head">
         <button class="ex-btn" data-p="close" aria-label="Закрыть">${icon('close')}</button>
-        <div class="ex-ptitle">${esc(e.name)}</div>
+        <div class="ex-ptitle"></div>
+        <span class="ex-pcount"></span>
+        <button class="ex-btn" data-p="prev" title="Предыдущий (←)" aria-label="Предыдущий">${icon('prev')}</button>
+        <button class="ex-btn" data-p="next" title="Следующий (→)" aria-label="Следующий">${icon('next')}</button>
         <button class="ex-btn" data-p="open" title="Открыть в новой вкладке" aria-label="Открыть в новой вкладке" disabled>${icon('external')}</button>
         <button class="ex-btn" data-p="download" title="Скачать" aria-label="Скачать">${icon('download')}</button>
-      </div><div class="ex-pbody"><div class="ex-empty">Загрузка…</div></div>`;
+      </div><div class="ex-pbody"></div>`;
     el.appendChild(pv);
+    pv.focus({ preventScroll: true });
     const body = pv.querySelector('.ex-pbody');
+    const many = list.length > 1;
+    pv.querySelectorAll('[data-p=prev],[data-p=next],.ex-pcount').forEach((b) => b.classList.toggle('ex-hidden', !many));
     let url = null;
+    let zoom = null;
+    let seq = 0;
+
+    function release() {
+      zoom?.destroy();
+      zoom = null;
+      if (url) {
+        URL.revokeObjectURL(url);
+        s.urls = s.urls.filter((u) => u !== url);
+        url = null;
+      }
+    }
+    function close() {
+      seq++;
+      release();
+      pv.remove();
+    }
+    const go = (d) => many && show((idx + d + list.length) % list.length);
+
     pv.addEventListener('click', (ev) => {
       const b = ev.target.closest('[data-p]');
       if (!b) return;
-      if (b.dataset.p === 'close') pv.remove();
-      if (b.dataset.p === 'download') download(e);
-      if (b.dataset.p === 'open' && url) window.open(url, '_blank', 'noopener');
+      const p = b.dataset.p;
+      if (p === 'close') close();
+      else if (p === 'prev') go(-1);
+      else if (p === 'next') go(1);
+      else if (p === 'download') download(list[idx]);
+      else if (p === 'open' && url) window.open(url, '_blank', 'noopener');
+      else if (p === 'zin') zoom?.zoomAt(1.5);
+      else if (p === 'zout') zoom?.zoomAt(1 / 1.5);
+      else if (p === 'zfit') zoom?.reset();
+    });
+    pv.addEventListener('keydown', (ev) => {
+      if (ev.target.closest('input, select, textarea')) return;
+      if (ev.key === 'Escape') close();
+      else if (ev.key === 'ArrowLeft') go(-1);
+      else if (ev.key === 'ArrowRight') go(1);
+      else return;
+      ev.preventDefault();
+      ev.stopPropagation();
     });
 
-    const ext = e.ext || '';
-    const canBlob = e.size !== null && e.size <= BLOB_PREVIEW_MAX;
-    const isText = TEXT.has(ext) && e.size <= TEXT_PREVIEW_MAX;
-    if (!canBlob || !(IMAGE.has(ext) || VIDEO.has(ext) || AUDIO.has(ext) || ext === 'pdf' || isText)) {
-      body.innerHTML = `<div class="ex-empty">Для «.${esc(ext || '—')}» просмотр в браузере недоступен${e.size > BLOB_PREVIEW_MAX ? ' (файл слишком большой)' : ''}.<br><br>
+    function unavailable(e, why) {
+      body.innerHTML = `<div class="ex-empty">${esc(why)}<br><br>
         <button class="ex-btn primary" data-p="download">${icon('download')} Скачать ${esc(fmtSize(e.size))}</button></div>`;
-      return;
     }
-    try {
-      const blob = await fetchBlob(e);
-      if (!pv.isConnected) return;
-      if (isText) {
-        const pre = document.createElement('pre');
-        pre.textContent = await blob.text();
-        body.replaceChildren(pre);
-        body.style.alignItems = 'flex-start';
-        return;
+
+    /** Asks the server for a converted copy; 202 means "still converting, ask again". */
+    async function fetchConverted(e, my) {
+      const t0 = Date.now();
+      const tick = () => {
+        const sec = Math.round((Date.now() - t0) / 1000);
+        const what = ['dwg', 'dxf'].includes(e.ext) ? 'чертёж' : ['tif', 'tiff', 'heic', 'heif', 'psd'].includes(e.ext) ? 'изображение' : 'документ';
+        const t = body.querySelector('.ex-pwait span');
+        if (t) t.textContent = `Готовлю ${what} к просмотру…${sec >= 2 ? ` ${sec} с` : ''}`;
+      };
+      body.innerHTML = '<div class="ex-pwait"><div class="ex-spin"></div><span></span></div>';
+      tick();
+      const timer = setInterval(tick, 1000);
+      try {
+        for (;;) {
+          const r = await call('GET', 'preview', { query: { root: s.root, path: e.path ?? joinRel(s.cwd, e.name) } });
+          if (my !== seq) return null;
+          if (r instanceof Response) return { blob: await readBlob(r, `Загрузка просмотра «${e.name}»`), type: r.headers.get('X-Preview-Type') };
+          await new Promise((res) => setTimeout(res, 1000));
+          if (my !== seq) return null;
+        }
+      } finally {
+        clearInterval(timer);
       }
-      url = keepUrl(blob);
-      pv.querySelector('[data-p=open]').disabled = false;
-      if (IMAGE.has(ext)) body.innerHTML = `<img src="${url}" alt="${esc(e.name)}">`;
-      else if (VIDEO.has(ext)) body.innerHTML = `<video src="${url}" controls playsinline></video>`;
-      else if (AUDIO.has(ext)) body.innerHTML = `<audio src="${url}" controls></audio>`;
-      else body.innerHTML = `<iframe src="${url}" title="${esc(e.name)}"></iframe>`;
-    } catch (err) {
-      s.progress = null;
-      renderStatus();
-      body.innerHTML = `<div class="ex-empty">${esc(err.message)}</div>`;
     }
+
+    function showImage(blob, { vector }) {
+      url = keepUrl(blob);
+      const host = document.createElement('div');
+      host.className = `ex-zoom${vector ? ' light' : ''}`;
+      const img = document.createElement('img');
+      img.alt = list[idx].name;
+      if (vector) img.dataset.vector = '1';
+      img.src = url;
+      host.appendChild(img);
+      const tools = document.createElement('div');
+      tools.className = 'ex-ztools';
+      tools.innerHTML = `<button class="ex-btn" data-p="zout" title="Уменьшить" aria-label="Уменьшить">${icon('minus')}</button>
+        <button class="ex-btn" data-p="zfit" title="По размеру окна" aria-label="По размеру окна">${icon('fit')}</button>
+        <button class="ex-btn" data-p="zin" title="Увеличить" aria-label="Увеличить">${icon('plus')}</button>`;
+      body.replaceChildren(host, tools);
+      zoom = zoomView(host, img, { onSwipe: go });
+      img.addEventListener('error', () => {
+        if (img.isConnected) unavailable(list[idx], 'Браузер не смог показать это изображение.');
+      }, { once: true });
+    }
+
+    async function show(i) {
+      idx = i;
+      const my = ++seq;
+      release();
+      const e = list[idx];
+      pv.querySelector('.ex-ptitle').textContent = e.name;
+      pv.querySelector('.ex-pcount').textContent = `${idx + 1} / ${list.length}`;
+      pv.querySelector('[data-p=open]').disabled = true;
+      body.style.alignItems = '';
+      const kind = previewKind(e);
+      if (!kind) {
+        const big = e.size > (CONVERT.has(e.ext) ? PREVIEW_CONVERT_MAX : BLOB_PREVIEW_MAX);
+        return unavailable(e, `Для «.${e.ext || '—'}» просмотр в браузере недоступен${big ? ' (файл слишком большой)' : ''}.`);
+      }
+      body.innerHTML = '<div class="ex-empty">Загрузка…</div>';
+      try {
+        let blob;
+        let as = kind;
+        if (kind === 'convert') {
+          const got = await fetchConverted(e, my);
+          if (!got) return;
+          blob = got.blob;
+          as = got.type === 'pdf' ? 'pdf' : got.type === 'svg' ? 'vector' : 'image';
+        } else {
+          const r = await call('GET', 'raw', { query: { root: s.root, path: e.path ?? joinRel(s.cwd, e.name) } });
+          if (my !== seq) return;
+          blob = await readBlob(r, `Загрузка «${e.name}»`);
+        }
+        if (my !== seq) return;
+        if (as === 'text') {
+          const pre = document.createElement('pre');
+          pre.textContent = await blob.text();
+          if (my !== seq) return;
+          body.replaceChildren(pre);
+          body.style.alignItems = 'flex-start';
+          return;
+        }
+        pv.querySelector('[data-p=open]').disabled = false;
+        if (as === 'image' || as === 'vector') return showImage(blob, { vector: as === 'vector' || e.ext === 'svg' });
+        url = keepUrl(blob);
+        if (as === 'video') body.innerHTML = `<video src="${url}" controls playsinline></video>`;
+        else if (as === 'audio') body.innerHTML = `<audio src="${url}" controls></audio>`;
+        else body.innerHTML = `<iframe src="${url}" title="${esc(e.name)}"></iframe>`;
+      } catch (err) {
+        if (my !== seq) return;
+        unavailable(e, err.message);
+      }
+    }
+
+    show(idx);
   }
 
   // ── Upload ──
