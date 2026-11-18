@@ -1,0 +1,19 @@
+dist/server.js
+  s_fe1d6b44b0a5ba::t_a5ef5296dfb048 847-853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "abcd7c541e92491276ad857582f5b80635fa745a",
+  "prompts": {},
+  "sessions": {
+    "s_fe1d6b44b0a5ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5156527-572e-4b9d-89c4-498d77a9d14a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Javidan Sadygov <jav1dan@live.com>"
+    }
+  }
+}
