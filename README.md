@@ -16,13 +16,25 @@
 
 ## Установка
 
+В CloudCLI откройте **Settings → Plugins**, вставьте ссылку на этот репозиторий
+и нажмите **Install**:
+
+```
+https://github.com/jav1dan/cloudcli-plugin-explorer
+```
+
+Или вручную, от имени пользователя, под которым работает CloudCLI:
+
 ```bash
-cp -r cloudcli-plugin-explorer ~/.claude-code-ui/plugins/
+git clone https://github.com/jav1dan/cloudcli-plugin-explorer.git ~/.claude-code-ui/plugins/cloudcli-plugin-explorer
 ```
 
 Папка должна быть настоящей, не симлинком: CloudCLI симлинки пропускает.
 Перезапуск не нужен — обновите страницу CloudCLI, вкладка «Проводник» появится;
-сервер плагина стартует при первом запросе.
+сервер плагина стартует при первом запросе. Обновление — кнопка **Update** в
+Settings → Plugins или `git pull` в папке плагина.
+
+Требования: CloudCLI с поддержкой плагинов (проверено на 1.37.9), Node.js 18+.
 
 ## Как это устроено
 
@@ -35,3 +47,7 @@ cp -r cloudcli-plugin-explorer ~/.claude-code-ui/plugins/
   Сервер работает от имени пользователя CloudCLI, так что права файловой системы
   соблюдаются как есть. Удаление симлинка удаляет только ссылку.
 - Поиск — обход в ширину с ограничениями: 5 секунд, 300 000 записей, до 200 результатов.
+
+## Лицензия
+
+MIT

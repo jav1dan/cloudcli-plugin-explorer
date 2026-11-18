@@ -3,7 +3,7 @@
   "displayName": "Проводник",
   "version": "1.0.0",
   "description": "Файлы проекта по одной папке: без лимита 10 000, поиск по имени, просмотр, загрузка и скачивание.",
-  "author": "ODD",
+  "author": "jav1dan",
   "icon": "icon.svg",
   "type": "module",
   "slot": "tab",
