@@ -38,6 +38,32 @@ Settings → Plugins или `git pull` в папке плагина.
 
 Требования: CloudCLI с поддержкой плагинов (проверено на 1.37.9), Node.js 18+.
 
+## Вместо встроенной вкладки «Файлы» (по желанию)
+
+CloudCLI не умеет скрывать или переставлять вкладки, но это делается CSS: ряд
+вкладок — flex-контейнер, а кнопка плагина подписана его `displayName`. Этот стиль
+скрывает «Файлы» и ставит «Проводник» на её место (после чата и терминала); если
+плагин отключён, селекторы ничего не находят и вкладки остаются как были.
+
+```css
+[role="tablist"]:has(> div > [role="tab"][aria-label="Проводник"]) > *{order:3}
+[role="tablist"]:has(> div > [role="tab"][aria-label="Проводник"]) > :nth-child(-n+2){order:0}
+[role="tablist"]:has(> div > [role="tab"][aria-label="Проводник"]) > div:has(> [role="tab"][aria-label="Проводник"]){order:1}
+[role="tablist"]:has(> div > [role="tab"][aria-label="Проводник"]) > div:has(> [role="tab"] svg.lucide-folder){display:none}
+```
+
+Чтобы не трогать собранный JS CloudCLI (он кэшируется браузером на год), стиль
+удобно вставить прокси в `index.html`, который CloudCLI отдаёт без кэша. Пример для
+nginx, в `location /`, который проксирует CloudCLI:
+
+```nginx
+proxy_set_header Accept-Encoding "";
+sub_filter_once on;
+sub_filter '</head>' '<style>…стиль выше в одну строку…</style></head>';
+```
+
+Встроенная вкладка остаётся доступной через палитру команд (Ctrl+K → «Files»).
+
 ## Как это устроено
 
 - CloudCLI проксирует `/api/plugins/explorer/rpc/*` на сервер плагина и передаёт
