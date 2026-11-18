@@ -1,7 +1,7 @@
 {
   "name": "explorer",
   "displayName": "Проводник",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Файлы проекта по одной папке: без лимита 10 000, учитывает .gitignore, поиск, просмотр документов и чертежей, ZIP папок, копирование и перенос.",
   "author": "jav1dan",
   "icon": "icon.svg",

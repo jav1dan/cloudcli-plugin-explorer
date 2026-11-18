@@ -800,7 +800,7 @@ async function jobStatus(q) {
 // ── Preview conversion ───────────────────────────────────────────────────
 // Formats a browser cannot show are converted on the server and cached by file
 // path + size + mtime: office documents to PDF (LibreOffice), DWG/DXF to SVG
-// (LibreDWG dwg2dxf + tools/dxf2svg.py on ezdxf), TIFF/HEIC/PSD to JPEG
+// (ODA File Converter or LibreDWG dwg2dxf, then tools/dxf2svg.py on ezdxf), TIFF/HEIC/PSD to JPEG
 // (ImageMagick). A conversion that outlasts PREVIEW_WAIT_MS answers 202 so the
 // request stays under Cloudflare's 100 s limit; the client asks again and gets
 // the same running conversion.
@@ -864,6 +864,29 @@ function run(cmd, args, { cwd, timeout = PREVIEW_TIMEOUT_MS } = {}) {
   });
 }
 
+/**
+ * DWG → DXF. ODA File Converter (if installed) reads practically every DWG;
+ * LibreDWG's dwg2dxf is the fallback. ODA is a Qt app with only the X11 platform
+ * plugin, so it runs under xvfb-run, and it skips symlinks, so it gets a copy.
+ */
+async function dwgToDxf(abs, input, tmp) {
+  const odaIn = path.join(tmp, 'oda-in');
+  const odaOut = path.join(tmp, 'oda-out');
+  try {
+    await fsp.mkdir(odaIn);
+    await fsp.mkdir(odaOut);
+    await fsp.copyFile(abs, path.join(odaIn, 'in.dwg'));
+    await run('xvfb-run', ['-a', 'ODAFileConverter', odaIn, odaOut, 'ACAD2018', 'DXF', '0', '1', 'in.dwg'], { cwd: tmp });
+    const dxf = path.join(odaOut, 'in.dxf');
+    if ((await fsp.stat(dxf)).size) return dxf;
+  } catch (err) {
+    if (err.status === 504) throw err; // out of time: a second converter won't fit either
+  }
+  const dxf = path.join(tmp, 'in.dxf');
+  await run('dwg2dxf', ['-y', '-o', dxf, input], { cwd: tmp });
+  return dxf;
+}
+
 async function convert(abs, ext, out) {
   const tmp = await fsp.mkdtemp(path.join(PREVIEW_DIR, 'tmp-'));
   try {
@@ -880,14 +903,11 @@ async function convert(abs, ext, out) {
     } else if (CAD.has(ext)) {
       await otherSlot(async () => {
         let dxf = input;
-        if (ext === 'dwg') {
-          dxf = path.join(tmp, 'in.dxf');
-          await run('dwg2dxf', ['-y', '-o', dxf, input], { cwd: tmp });
-        }
+        if (ext === 'dwg') dxf = await dwgToDxf(abs, input, tmp);
         await run('python3', [DXF2SVG, dxf, path.join(tmp, 'out.svg')], { cwd: tmp });
       }).catch((err) => {
         // LibreDWG reads most but not all DWG files; the converter's stderr means nothing to a user.
-        if (err.status === 422) throw new HttpError(422, 'Этот чертёж не удалось отрисовать на сервере — LibreDWG читает не все DWG. Скачайте его и откройте в AutoCAD.');
+        if (err.status === 422) throw new HttpError(422, 'Этот чертёж не удалось отрисовать на сервере. Скачайте его и откройте в AutoCAD.');
         throw err;
       });
       made = path.join(tmp, 'out.svg');

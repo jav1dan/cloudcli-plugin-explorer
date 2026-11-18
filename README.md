@@ -55,13 +55,22 @@ Settings → Plugins или `git pull` в папке плагина.
 | Формат | Во что | Нужно (Debian / Ubuntu) |
 | --- | --- | --- |
 | doc, docx, rtf, odt, xls, xlsx, ods, ppt, pptx, odp, vsd… | PDF | `libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress` и шрифты (`fonts-liberation`, `fonts-crosextra-carlito`, `fonts-crosextra-caladea`) |
-| dwg, dxf | SVG | [LibreDWG](https://www.gnu.org/software/libredwg/) (`dwg2dxf`) и `python3-ezdxf` |
+| dwg, dxf | SVG | `python3-ezdxf` и конвертер DWG → DXF: [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) (бесплатный, своя лицензия; плюс `xvfb`, `libopengl0`) и/или [LibreDWG](https://www.gnu.org/software/libredwg/) (`dwg2dxf`) |
 | tif, tiff, heic, heif, psd | JPEG | `imagemagick` (для HEIC — `libheif`) |
 
 Результат кэшируется в `~/.cache/cloudcli-explorer/preview` (до 2 ГБ, старые
 удаляются) по пути, размеру и времени изменения файла: повторный просмотр мгновенный.
-LibreDWG читает не все DWG — на реальном архиве проектов отрисовалось около 60 %;
-для остальных показывается сообщение и кнопка «Скачать».
+DWG сначала отдаётся ODA File Converter (если установлен): он читает практически
+любые DWG. Если его нет или он не справился — LibreDWG, который на реальном архиве
+проектов осилил около 60 % чертежей. Для неудавшихся показывается сообщение и кнопка
+«Скачать».
+
+ODA File Converter на Debian / Ubuntu (сервер без экрана):
+
+```bash
+sudo apt install ./ODAFileConverter_QT6_lnxX64_11dll_<версия>.deb xvfb xauth libopengl0
+xvfb-run -a ODAFileConverter   # проверка: без ошибок про библиотеки
+```
 
 ## Вместо встроенной вкладки «Файлы» (по желанию)
 
@@ -95,9 +104,10 @@ sub_filter '</head>' '<style>…стиль выше в одну строку…<
   тело только как JSON, поэтому загрузка идёт base64-частями во временный скрытый
   файл, который переименовывается в настоящий после последней части.
 - Конвертация для просмотра (`GET /preview`) идёт в отдельной группе процессов с
-  таймаутом 3 минуты, LibreOffice — по одному файлу (свой профиль в кэше), остальные —
+  таймаутом 3 минуты на шаг, LibreOffice — по одному файлу (свой профиль в кэше), остальные —
   по два. Если конвертация дольше 45 секунд, сервер отвечает 202 и клиент спрашивает
-  снова — к той же задаче. DWG сначала переводится в DXF (`dwg2dxf`), затем
+  снова — к той же задаче. DWG сначала переводится в DXF (ODA File Converter под `xvfb-run -a` — ему
+  даётся копия файла, симлинки он пропускает; иначе `dwg2dxf`), затем
   `dist/tools/dxf2svg.py` рисует пространство модели (или самый заполненный лист) на
   белом фоне; он чинит типичные дефекты DXF от LibreDWG — переводы строк в тексте и
   записи таблиц без имени.
